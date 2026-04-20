@@ -11,6 +11,8 @@
 #include <libuser.h>
 #include <SystemCalls.h>
 #include <Devices.h>
+#include <stddef.h> 
+
 
 /* Set the disk arm scheduling algorithm.
  * See Devices.h for available constants (DISK_ARM_ALG_FCFS, DISK_ARM_ALG_SSTF, etc.).
@@ -43,6 +45,23 @@ typedef struct
     char deviceName[THREADS_MAX_DEVICE_NAME];
 } DiskInformation;
 
+typedef struct
+{
+    TListNode link;         /* Required by TList to link nodes together */
+    int pid;                /* Who requested this? */
+    int type;               /* DISK_READ or DISK_WRITE */
+    int track;              /* Which track? */
+    int firstSector;        /* Starting sector */
+    int numSectors;         /* How many sectors? */
+    void* buffer;           /* Data buffer */
+    int status;             /* Result of the operation */
+    int syncMbox;           /* Mailbox to wake the process when done */
+} DiskRequest;
+
+/* Create an array of lists, one for each disk */
+static TList diskQueues[THREADS_MAX_DISKS];
+static int diskSemaphores[THREADS_MAX_DISKS]; // <-- ADD THIS
+
 static DevicesProcess devicesProcs[MAXPROC];
 static DiskInformation diskInfo[THREADS_MAX_DISKS];
 
@@ -50,39 +69,30 @@ static inline void checkKernelMode(const char* functionName);
 extern int DevicesEntryPoint(char*);
 
 /* You'll need to map this function to your systemCallVectors array in SystemCallsEntryPoint */
-void SleepSecondsHandler(sysargs* args)
+void SleepSecondsHandler(system_call_arguments_t* args)
 {
     checkKernelMode(__func__);
 
-    // Cast to intptr_t first to clear the C4311 compiler warning
-    int seconds = (int)(intptr_t)args->arg1;
-
-    // Use k_getpid() instead of getpid()
+    // Arguments are stored in a 0-indexed array
+    int seconds = (int)args->arguments[0];
     int pid = k_getpid();
     int currentTime;
 
-    // Based on the output of DevicesTest20, invalid sleep times return -1
     if (seconds <= 0)
     {
-        args->arg4 = (void*)-1;
+        args->arguments[0] = -1; // Return error in index 0
         return;
     }
 
-    // ADD THIS (Using the kernel clock function from THREADSLib.h):
     currentTime = system_clock();
 
-    // The system clock is in MICROSECONDS. 1 second = 1,000,000 ticks.
     devicesProcs[pid].wakeTime = currentTime + (seconds * 1000000);
     devicesProcs[pid].isSleeping = 1;
 
-    // ACTUAL BLOCKING MECHANISM:
     int dummy = 0;
-
-    // Use mailbox_receive with the TRUE flag to block
     mailbox_receive(devicesProcs[pid].syncMbox, &dummy, sizeof(int), TRUE);
 
-    // When MboxReceive unblocks, the clock driver has woken us up!
-    args->arg4 = (void*)0; // Return success status
+    args->arguments[0] = 0; // Return success in index 0
 }
 
 int SystemCallsEntryPoint(char* arg)
@@ -99,12 +109,18 @@ int SystemCallsEntryPoint(char* arg)
     /* Assign system call handlers */
     systemCallVector[SYS_SLEEP] = (void*)SleepSecondsHandler;
 
-    /* Initialize the process table */
-    for (int i = 0; i < MAXPROC; ++i)
+    /*Initialize the process table */
+        for (int i = 0; i < MAXPROC; ++i)
+        {
+            devicesProcs[i].isSleeping = 0;
+            devicesProcs[i].syncMbox = mailbox_create(0, sizeof(int));
+        }
+
+    // ADD THIS TO INITIALIZE QUEUES AND SEMAPHORES:
+    for (i = 0; i < THREADS_MAX_DISKS; i++)
     {
-        devicesProcs[i].isSleeping = 0;
-        // FIX: Use the correct function from Messaging.h
-        devicesProcs[i].syncMbox = mailbox_create(0, sizeof(int));
+        TListInitialize(&diskQueues[i], offsetof(DiskRequest, link), NULL);
+        diskSemaphores[i] = k_semcreate(0);
     }
 
     /* Create and start the clock driver */
@@ -143,25 +159,13 @@ int SystemCallsEntryPoint(char* arg)
         k_kill(diskPids[i], SIG_TERM);
 
         // ==========================================================
-        // Poke the hardware to fire an interrupt and wake the driver
+        // Poke the SEMAPHORE to wake the driver so it can die cleanly
         // ==========================================================
-        char devName[16];
-        sprintf(devName, "disk%d", i);
-
-        device_control_block_t dcb;
-        dcb.command = DISK_INFO;
-        dcb.control1 = 0;
-        dcb.control2 = 0;
-        dcb.input_data = NULL;
-        dcb.output_data = NULL;
-        dcb.data_length = 0;
-
-        device_control(devName, dcb);
+        k_semv(diskSemaphores[i]);
         // ==========================================================
 
         k_join(diskPids[i], &status); // Now it will successfully reap!
     }
-    // =================================================================
 
     return 0;
 }
@@ -229,14 +233,39 @@ static int DiskDriver(char* arg)
     /* Operating loop */
     while (!signaled())
     {
-        // Capture the return value of wait_device
-        result = wait_device(devName, &status);
+        // 1. Sleep here until a handler calls k_semv() indicating a new request!
+        k_semp(diskSemaphores[unit]);
 
-        // If the system is shutting down, wait_device returns a non-zero error.
-        // We must break the loop so the thread can cleanly exit.
-        if (result != 0)
+        if (signaled()) break; // Catch shutdown signals
+
+        // 2. Pop the oldest request
+        DiskRequest* nextReq = NULL;
+        if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS)
         {
-            break;
+            nextReq = (DiskRequest*)TListPopNode(&diskQueues[unit]);
+        }
+
+        if (nextReq != NULL)
+        {
+            // 3. Talk to the physical hardware
+            device_control_block_t dcb;
+            dcb.command = nextReq->type;
+            dcb.input_data = nextReq->buffer;
+            dcb.data_length = nextReq->numSectors * THREADS_DISK_SECTOR_SIZE;
+            // NOTE: We will pack control1 and control2 in the next step!
+
+            device_control(devName, dcb);
+
+            // 4. Sleep until the physical disk finishes spinning
+            result = wait_device(devName, &status);
+            if (result != 0) break;
+
+            // 5. Mark success and wake the user process
+            nextReq->status = status;
+            currentTrack = nextReq->track;
+
+            int dummy = 0;
+            mailbox_send(nextReq->syncMbox, &dummy, sizeof(int), TRUE);
         }
     }
     return 0;
